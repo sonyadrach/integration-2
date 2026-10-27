@@ -1,9 +1,14 @@
 import logging
 import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
+import jwt
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 from tenacity import (
     retry,
@@ -12,7 +17,7 @@ from tenacity import (
     wait_fixed,
 )
 
-from . import crud, schemas
+from . import crud, models, schemas
 from .database import Base, engine, get_db
 
 load_dotenv()
@@ -32,6 +37,11 @@ FORECAST_URL = os.getenv(
 FORECAST_TIMEOUT = float(
     os.getenv("FORECAST_TIMEOUT", "3.0")
 )
+
+ACCESS_TOKEN_EXPIRE_MINUTES = int(
+    os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30")
+)
+
 FORECAST_FEATURE_KEYS = {
     "gr_liv_area",
     "total_bsmt_sf",
@@ -40,13 +50,67 @@ FORECAST_FEATURE_KEYS = {
     "overall_qual",
     "ms_zoning",
 }
+
+ALGORITHM = "HS256"
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+def get_jwt_secret() -> str:
+    """Read the JWT signing key exclusively from the Docker secret file."""
+    secret_path = Path("/run/secrets/jwt_secret_key")
+    if not secret_path.is_file():
+        raise RuntimeError(f"Required secret 'jwt_secret_key' is missing at {secret_path}")
+    return secret_path.read_text(encoding="utf-8").strip()
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify raw password against bcrypt hash."""
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    """Generate bcrypt hash for password."""
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
+    """Create a signed JWT token containing subject, issued-at, and expiration claims."""
+    to_encode = data.copy()
+    now = datetime.now(timezone.utc)
+    expire = now + (expires_delta if expires_delta else timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"iat": now, "exp": expire})
+    return jwt.encode(to_encode, get_jwt_secret(), algorithm=ALGORITHM)
+
+
+def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db),
+) -> models.User:
+    """Validate Bearer JWT token, verify user existence, and check active status."""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        # Валідація токена з явною вимогою алгоритму HS256 проти algorithm confusion / alg: none
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except jwt.PyJWTError:
+        raise credentials_exception
+
+    user = db.query(models.User).filter(models.User.username == username).first()
+    if user is None or not user.is_active:
+        raise credentials_exception
+
+    return user
+
+
 # Tables are created automatically for the initial version.
-# In production, replace this with Alembic migrations.
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="Orders API",
-    version="0.1.0",
+    version="0.2.0",
 )
 
 
@@ -57,11 +121,7 @@ app = FastAPI(
     reraise=True,
 )
 def _request_prediction(payload: dict) -> float:
-    """Request a price prediction from the forecasting service.
-
-    Only features relevant to the ML model are sent.
-    """
-    # фільтрування лише поля нерухомості 
+    """Request a price prediction from the forecasting service."""
     model_payload = {k: v for k, v in payload.items() if k in FORECAST_FEATURE_KEYS}
 
     with httpx.Client(timeout=FORECAST_TIMEOUT) as client:
@@ -72,30 +132,93 @@ def _request_prediction(payload: dict) -> float:
         response.raise_for_status()
         return float(response.json()["predicted_price"])
 
+
+# --- Public Endpoints ---
+
 @app.get("/health")
 def health() -> dict[str, str]:
-    """Return the health status of the Orders API."""
+    """Return the health status of the Orders API (Unauthenticated)."""
     return {"status": "ok"}
 
+
+# --- Authentication Endpoints (R2.4) ---
+
+@app.post(
+    "/auth/register",
+    response_model=schemas.UserOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def register(
+    user_in: schemas.UserCreate,
+    db: Session = Depends(get_db),
+):
+    """Register a new user."""
+    existing_user = db.query(models.User).filter(models.User.username == user_in.username).first()
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Username already taken",
+        )
+
+    user = models.User(
+        username=user_in.username,
+        hashed_password=get_password_hash(user_in.password),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@app.post(
+    "/auth/login",
+    response_model=schemas.Token,
+)
+def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+):
+    """OAuth2 password flow login yielding a Bearer JWT."""
+    user = db.query(models.User).filter(models.User.username == form_data.username).first()
+    # Однакове повідомлення про помилку для захисту від enumeration-атак
+    if user is None or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    access_token = create_access_token(data={"sub": user.username})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@app.get(
+    "/auth/me",
+    response_model=schemas.UserOut,
+)
+def read_current_user(
+    current_user: models.User = Depends(get_current_user),
+):
+    """Retrieve details of the currently authenticated user."""
+    return current_user
+
+
+# --- Authenticated Orders Endpoints (R2.6) ---
 
 @app.post(
     "/orders",
     response_model=schemas.OrderRead,
-    status_code=201,
+    status_code=status.HTTP_201_CREATED,
 )
 def create_order(
     data: schemas.OrderCreate,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
 ):
-    """Create an order and attempt to obtain a price prediction.
-
-    If the forecasting service is unavailable, the order is still
-    persisted with a null predicted price (graceful degradation).
-    """
+    """Create an order (Graceful Degradation if forecast fails)."""
     try:
         price = _request_prediction(data.model_dump())
     except (httpx.RequestError, httpx.HTTPStatusError) as exc:
-        # Логує як warning без падіння обробника
         logger.warning(
             "Forecast service unavailable or returned error: %s. Proceeding with price=None.",
             exc,
@@ -120,6 +243,7 @@ def list_orders(
     limit: int = 20,
     offset: int = 0,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
 ):
     """Return a paginated list of orders."""
     if limit < 1 or limit > 100:
@@ -148,6 +272,7 @@ def list_orders(
 def get_order(
     oid: int,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
 ):
     """Return a single order by ID."""
     order = crud.get_order(db, oid)
@@ -169,6 +294,7 @@ def update_order(
     oid: int,
     data: schemas.OrderUpdate,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
 ):
     """Update an existing order and recalculate price if property features change."""
     order = crud.get_order(db, oid)
@@ -182,11 +308,9 @@ def update_order(
     update_dict = data.model_dump(exclude_unset=True)
     new_price = None
 
-    # Перевіряє чи є серед змінених полів характеристики житла
     has_property_changes = any(field in FORECAST_FEATURE_KEYS for field in update_dict)
 
     if has_property_changes:
-        # бере нові значення а незмінені - з існуючого запису в базі
         features = {}
         for field in FORECAST_FEATURE_KEYS:
             if field in update_dict:
@@ -202,7 +326,7 @@ def update_order(
                 oid,
                 exc,
             )
-           
+
     return crud.update_order(
         db,
         order,
@@ -213,11 +337,12 @@ def update_order(
 
 @app.delete(
     "/orders/{oid}",
-    status_code=204,
+    status_code=status.HTTP_204_NO_CONTENT,
 )
 def delete_order(
     oid: int,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
 ) -> None:
     """Delete an existing order."""
     order = crud.get_order(db, oid)
